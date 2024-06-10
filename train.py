@@ -94,6 +94,9 @@ class Logger:
         if self.log_to == "wandb" and rank==0:
             import wandb
             wandb.init(project=project_name, entity=entity, group=group, name=name, config=args)
+        if self.log_to == "mlflow" and rank==0:
+            import mlflow
+
 
     def log(self, d:Dict, rank:int):
         if rank != 0: return
@@ -102,6 +105,8 @@ class Logger:
                 tqdm.write(f'{k}: {v}')
         elif self.log_to == "wandb":
             wandb.log(d)
+        elif self.log_to == "mlflow":
+            pass
         elif self.log_to == "stdout":
             for k,v in d.items():
                 print(f'{k}: {v}')
@@ -491,15 +496,37 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
     with profiler_context as prof:
         # Setup and initialize the process group
-        os.environ['MASTER_ADDR'] = args["master_addr"]
-        os.environ['MASTER_PORT'] = args["master_port"]
-        if 'SLURM_PROCID' in os.environ:
-            # assumes same number of GPUs per node.
-            rank = int(os.environ['SLURM_PROCID']) * torch.cuda.device_count() + local_rank
-        else:
-            rank = local_rank
+        #os.environ['MASTER_ADDR'] = args["master_addr"]
+        #os.environ['MASTER_PORT'] = args["master_port"]
 
+        # if 'SLURM_PROCID' in os.environ:
+        #     # assumes same number of GPUs per node.
+        #     rank = int(os.environ['SLURM_PROCID']) * torch.cuda.device_count() + local_rank
+        # else:
+        #     rank = local_rank
+
+        ### variables that were set in the SLURM script
+        os.environ['FI_EFA_FORK_SAFE']='1'
+        os.environ['FI_EFA_USE_DEVICE_RDMA']='1' # use for p4dn
+        os.environ['FI_EFA_ENABLE_SHM_TRANSFER']='0'
+        os.environ['OMPI_MCA_mtl_base_verbose']='1'
+        os.environ['FI_PROVIDER']='efa'
+        os.environ['NCCL_TREE_THRESHOLD']='0'
+
+        #os.environ['NCCL_DEBUG']='INFO'
+        os.environ['NCCL_SOCKET_TIMEOUT']='600000' # Set the timeout to 10 minutes (60000 milliseconds)
+        os.environ['NCCL_DEBUG_SUBSYS']='ALL'
+        #os.environ['TORCH_DISTRIBUTED_DEBUG']='INFO'
+
+        os.environ['NCCL_IBEXT_DISABLE']='1'
+        os.environ['NCCL_P2P_DISABLE'] = '1'
+        os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'
+
+        rank = int(os.environ['RANK'])
+        print(f'rank: {rank} world_size: {world_size}')
+        
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        #dist.init_process_group("nccl")
         torch.cuda.set_device(local_rank)
         if args["use_cpu_offload"]:
             torch.set_num_threads(os.cpu_count()//(min(world_size, torch.cuda.device_count())))
@@ -1052,6 +1079,7 @@ def fsdp_qlora(
     entity: str = None, # For wandb logging
     n_bits: int = 4, # passed to hqq
     profiling_output: str = None, # Output file for profiling
+    hugging_face_token: str = None
     ):
     """
     Train a model with FSDP and QLoRA/QDoRA.
@@ -1102,6 +1130,10 @@ def fsdp_qlora(
         profiling_output: Output file for profiling
     """
 
+    # set huggingface token
+    if hugging_face_token:
+        os.environ['HUGGING_FACE_HUB_TOKEN'] = hugging_face_token
+
     # Set world size
     if world_size == -1:
         world_size = torch.cuda.device_count()
@@ -1109,6 +1141,7 @@ def fsdp_qlora(
 
     # Get all args which will be passed to fsdp_main
     args = dict(locals())
+    del args["hugging_face_token"]
     set_seed(args['seed'])
     validate_args(args)
     if args['verbose']: print(args)
@@ -1187,5 +1220,6 @@ def main(
     entity: str = None, # For wandb logging
     n_bits: int = 4, # passed to hqq
     profiling_output: str = "", # Output file prefix for profiling
+    hugging_face_token: str = None
 ):
     fsdp_qlora(**locals())

@@ -87,6 +87,8 @@ sys.path.append("./scripts")
 from lora import LORA
 from dora import BNBDORA, HQQDORA, DORALayer, MagnitudeLayer
 
+import mlflow
+
 class Logger:
     def __init__(self, args, log_to="stdout", project_name="fsdp_qlora", entity=None, group=None, name=None, rank=0):
         # self.log_every_n_steps = log_every_n_steps TODO: add this back as an option
@@ -95,8 +97,21 @@ class Logger:
             import wandb
             wandb.init(project=project_name, entity=entity, group=group, name=name, config=args)
         if self.log_to == "mlflow" and rank==0:
-            import mlflow
 
+            mlflow.set_registry_uri('databricks-uc')
+
+            # we will just reuse the wandb structure for now
+            ## the entity in our case will be the username
+            ## Whilst we could do nested runs with group we will skip for now
+            #experiment_name = f'/Users/{entity}/{project_name}'
+            mlflow.set_experiment(experiment_id=args['mlflow_exp_id'])
+
+            try:
+                mlflow.end_run()
+            except Exception:
+                pass
+
+            mlflow.start_run(run_name=name)
 
     def log(self, d:Dict, rank:int):
         if rank != 0: return
@@ -106,13 +121,14 @@ class Logger:
         elif self.log_to == "wandb":
             wandb.log(d)
         elif self.log_to == "mlflow":
-            pass
+            mlflow.log_metrics(d)
         elif self.log_to == "stdout":
             for k,v in d.items():
                 print(f'{k}: {v}')
 
     def finish(self, rank=0):
         if self.log_to == "wandb" and rank==0: wandb.finish()
+        if self.log_to == "mlflow" and rank==0: mlflow.end_run()
 
 
 def update_progress_bar(progress_bar:tqdm, epoch:int, log_loss:float, log_lr:float, rank:int):
@@ -736,7 +752,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 else:
                     p.requires_grad = False
     
-        if args["log_to"] == 'wandb':
+        if args["log_to"] in ['wandb', 'mlflow']:
             logger.log({"memory/allocated_after_model_created": torch.cuda.memory_allocated(local_rank)}, rank)
             logger.log({"memory/reserved_after_model_creation": torch.cuda.memory_reserved(local_rank)}, rank)
 
@@ -777,7 +793,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         )
         if rank == 0 or args['verbose']:
             print(f"Rank {rank}: Wrapped model: {torch.cuda.memory_reserved(local_rank)/2**30:.3f} GiB")
-        if args["log_to"] == 'wandb':
+        if args["log_to"] in ['wandb', 'mlflow']:
             logger.log({"memory/allocated_after_model_wrap": torch.cuda.memory_allocated(local_rank)}, rank)
             logger.log({"memory/reserved_after_model_wrap": torch.cuda.memory_reserved(local_rank)}, rank)
 
@@ -871,7 +887,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 if batch_idx == 0 and epoch == 0 and (rank == 0 or args['verbose']):
                     reserved_before_forward = torch.cuda.memory_reserved(local_rank)
                     memory_stats.append(f"Rank {rank}: Before forward: {reserved_before_forward/2**30:.2f} GiB")
-                    if args["log_to"] == 'wandb':
+                    if args["log_to"] in ['wandb', 'mlflow']:
                         logger.log({"memory/allocated_before_forward": torch.cuda.memory_allocated(local_rank)}, rank)
                         logger.log({"memory/reserved_before_forward": reserved_before_forward}, rank)
 
@@ -892,7 +908,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     if batch_idx == 0 and epoch == 0 and (rank == 0 or args['verbose']):
                         reserved_after_forward = torch.cuda.memory_reserved(local_rank)
                         memory_stats.append(f"Rank {rank}: After forward: {reserved_after_forward/2**30:.2f} GiB")
-                        if args["log_to"] == 'wandb':
+                        if args["log_to"] in ['wandb', 'mlflow']:
                             logger.log({"memory/allocated_after_forward": torch.cuda.memory_allocated(local_rank)}, rank)
                             logger.log({"memory/reserved_after_forward": reserved_after_forward}, rank)
 
@@ -926,7 +942,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 if batch_idx == 0 and epoch == 0 and (rank == 0 or args['verbose']):
                     reserved_after_backward = torch.cuda.memory_reserved(local_rank)
                     memory_stats.append(f"Rank {rank}: After backward: {reserved_after_backward/2**30:.2f} GiB")
-                    if args["log_to"] == 'wandb':
+                    if args["log_to"] in ['wandb', 'mlflow']:
                         logger.log({"memory/allocated_after_backward": torch.cuda.memory_allocated(local_rank)}, rank)
                         logger.log({"memory/reserved_after_backward": reserved_after_backward}, rank)
 
@@ -949,7 +965,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                         else:
                             log_lr = args["lr"]
                         update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
-                        if args["log_to"] == 'wandb':
+                        if args["log_to"] in ['wandb', 'mlflow']:
                             logger.log({"loss": log_loss, "lr": log_lr}, rank)
                     ddp_loss = torch.zeros(2).to(local_rank)
 
@@ -959,7 +975,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 peak_reserved_memory  = torch.cuda.max_memory_reserved(local_rank)
                 memory_stats.append(f"Rank {rank}: Peak allocated memory: {peak_allocated_memory/2**30:.2f} GiB")
                 memory_stats.append(f"Rank {rank}: Peak reserved memory:  {peak_reserved_memory/2**30:.2f} GiB")
-                if args["log_to"] == 'wandb':
+                if args["log_to"] in ['wandb', 'mlflow']:
                     logger.log({"memory/allocated_peak": peak_allocated_memory}, rank)
                     logger.log({"memory/reserved_peak": peak_reserved_memory}, rank)
 
@@ -1079,7 +1095,10 @@ def fsdp_qlora(
     entity: str = None, # For wandb logging
     n_bits: int = 4, # passed to hqq
     profiling_output: str = None, # Output file for profiling
-    hugging_face_token: str = None
+    hugging_face_token: str = None,
+    databricks_host: str = None,
+    databricks_token: str = None,
+    mlflow_exp_id: int = None
     ):
     """
     Train a model with FSDP and QLoRA/QDoRA.
@@ -1130,6 +1149,10 @@ def fsdp_qlora(
         profiling_output: Output file for profiling
     """
 
+    if databricks_host:
+        os.environ['DATABRICKS_HOST'] = databricks_host
+        os.environ['DATABRICKS_TOKEN'] = databricks_token
+
     # set huggingface token
     if hugging_face_token:
         os.environ['HUGGING_FACE_HUB_TOKEN'] = hugging_face_token
@@ -1141,7 +1164,7 @@ def fsdp_qlora(
 
     # Get all args which will be passed to fsdp_main
     args = dict(locals())
-    del args["hugging_face_token"]
+    #del args["hugging_face_token"]
     set_seed(args['seed'])
     validate_args(args)
     if args['verbose']: print(args)
@@ -1210,7 +1233,7 @@ def main(
     optimizer: Param("", choices=["adamw", "adam", "sgd", "adadelta"]) = "adamw", # Optimizer
     lr_scheduler: Param("", choices=["constant", "linear", "cosine"]) = "constant", # Learning Rate Scheduler. linear and cosine warm up for 10% of training steps.
     loading_workers: int = -1, # Number of layers to load and quantize in parallel per GPU. Default of -1 uses heuristics to set worker count.
-    log_to: Param("", choices=["tqdm", "wandb", "stdout"]) = "tqdm", # Where to log output
+    log_to: Param("", choices=["tqdm", "wandb", "stdout", "mlflow"]) = "tqdm", # Where to log output
     master_addr: str = "localhost", # For distributed training
     master_port: str = "12355", # For distributed training, must be the same for all processes
     seed: int = 42, # Random seed
@@ -1220,6 +1243,9 @@ def main(
     entity: str = None, # For wandb logging
     n_bits: int = 4, # passed to hqq
     profiling_output: str = "", # Output file prefix for profiling
-    hugging_face_token: str = None
+    hugging_face_token: str = None, # for loading models that require permission
+    databricks_host: str = None,
+    databricks_token: str = None,
+    mlflow_exp_id: int = None
 ):
     fsdp_qlora(**locals())
